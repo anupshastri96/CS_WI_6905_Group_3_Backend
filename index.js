@@ -11,27 +11,33 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// AWS Configuration
-AWS.config.update({
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+// AWS Configuration (Use IAM Role if running on EC2)
+const awsConfig = {
   region: process.env.AWS_REGION || "us-east-1",
-});
+};
+
+// Use environment credentials only if not running on EC2 with IAM roles
+if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+  awsConfig.accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+  awsConfig.secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+}
+
+AWS.config.update(awsConfig);
 
 // DynamoDB
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME || "MedicalRecords";
 
-// S3
+// S3 Storage
 const s3 = new AWS.S3();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// API: Health Check
+// ✅ Health Check API
 app.get("/", (req, res) => {
   res.json({ message: "Node.js Backend is Running! 🚀" });
 });
 
-// API: Get User Data
+// ✅ Fetch User Data
 app.get("/user", (req, res) => {
   const userData = {
     name: "John Doe",
@@ -43,7 +49,7 @@ app.get("/user", (req, res) => {
   res.json(userData);
 });
 
-// API: Get Recent Records
+// ✅ Fetch Recent Records
 app.get("/records", (req, res) => {
   const records = [
     { name: "General Checkup", date: "Jan 15, 2025" },
@@ -52,7 +58,7 @@ app.get("/records", (req, res) => {
   res.json(records);
 });
 
-// API: Get Active Prescriptions
+// ✅ Fetch Active Prescriptions
 app.get("/prescriptions", (req, res) => {
   const prescriptions = [
     { name: "Amoxicillin", dosage: "3 times daily - 7 days" },
@@ -61,7 +67,7 @@ app.get("/prescriptions", (req, res) => {
   res.json(prescriptions);
 });
 
-// API: Get Upcoming Appointments
+// ✅ Fetch Upcoming Appointments
 app.get("/appointments", (req, res) => {
   const appointments = [
     { doctor: "Dr. Sarah Smith", date: "Feb 1, 2025" },
@@ -69,29 +75,38 @@ app.get("/appointments", (req, res) => {
   res.json(appointments);
 });
 
-// API: Upload X-ray to S3
+// ✅ Upload X-ray to S3
 app.post("/upload-xray", upload.single("xray"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" });
   }
 
+  const timestamp = Date.now();
+  const filename = `${timestamp}-${req.file.originalname}`;
+
   const params = {
     Bucket: process.env.S3_BUCKET_NAME,
-    Key: `${Date.now()}-${req.file.originalname}`,
+    Key: filename,
     Body: req.file.buffer,
     ContentType: req.file.mimetype,
   };
 
   try {
     const uploadResult = await s3.upload(params).promise();
-    res.json({ message: "X-Ray uploaded successfully!", url: uploadResult.Location });
+    
+    res.json({
+      message: "X-Ray uploaded successfully!",
+      url: uploadResult.Location,
+      fileName: filename,
+      timestamp: timestamp,
+    });
   } catch (error) {
     console.error("S3 Upload Error:", error);
-    res.status(500).json({ error: "Upload failed" });
+    res.status(500).json({ error: "Upload failed", details: error.message });
   }
 });
 
-// API: Store Medical Record in DynamoDB
+// ✅ Store Medical Record in DynamoDB
 app.post("/save-medical-record", async (req, res) => {
   const { PatientID, Diagnosis, Date } = req.body;
 
@@ -99,17 +114,67 @@ app.post("/save-medical-record", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const params = {
+  const checkIfExists = {
     TableName: TABLE_NAME,
-    Item: { PatientID, Diagnosis, Date },
+    Key: { PatientID },
   };
 
   try {
+    const existingRecord = await dynamoDB.get(checkIfExists).promise();
+
+    if (existingRecord.Item) {
+      return res.status(409).json({ error: "Record already exists for this patient." });
+    }
+
+    const params = {
+      TableName: TABLE_NAME,
+      Item: { PatientID, Diagnosis, Date },
+    };
+
     await dynamoDB.put(params).promise();
-    res.json({ message: "Medical record saved successfully!" });
+    res.json({ message: "Medical record saved successfully!", data: params.Item });
   } catch (error) {
     console.error("DynamoDB Error:", error);
-    res.status(500).json({ error: "Error saving record" });
+    res.status(500).json({ error: "Error saving record", details: error.message });
+  }
+});
+
+// ✅ Fetch Medical Record by PatientID
+app.get("/medical-record/:patientID", async (req, res) => {
+  const { patientID } = req.params;
+
+  const params = {
+    TableName: TABLE_NAME,
+    Key: { PatientID: patientID },
+  };
+
+  try {
+    const data = await dynamoDB.get(params).promise();
+    if (!data.Item) {
+      return res.status(404).json({ error: "No medical record found for this PatientID" });
+    }
+    res.json(data.Item);
+  } catch (error) {
+    console.error("DynamoDB Fetch Error:", error);
+    res.status(500).json({ error: "Error fetching record", details: error.message });
+  }
+});
+
+// ✅ Delete Medical Record
+app.delete("/delete-medical-record/:patientID", async (req, res) => {
+  const { patientID } = req.params;
+
+  const params = {
+    TableName: TABLE_NAME,
+    Key: { PatientID: patientID },
+  };
+
+  try {
+    await dynamoDB.delete(params).promise();
+    res.json({ message: "Medical record deleted successfully" });
+  } catch (error) {
+    console.error("DynamoDB Delete Error:", error);
+    res.status(500).json({ error: "Error deleting record", details: error.message });
   }
 });
 
