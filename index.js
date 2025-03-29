@@ -263,6 +263,39 @@ app.get("/prescriptions", async (req, res) => {
   }
 });
 
+// ==========
+// Store X-Ray Prediction in DynamoDB
+// ==========
+app.post("/save-xray-prediction", async (req, res) => {
+  const userSub = req.user.sub; // Get Cognito user ID
+  const { prediction, fileName, timestamp } = req.body; // Expecting this from frontend
+
+  if (!prediction || !fileName || !timestamp) {
+    return res.status(400).json({ error: "Missing required fields: prediction, fileName, timestamp" });
+  }
+
+  const recordID = `XRAY#${timestamp}`;
+
+  const params = {
+    TableName: TABLE_NAME,
+    Item: {
+      PatientID: userSub,  // Associate with the user
+      RecordID: recordID,  // Unique X-ray record ID
+      Prediction: prediction,
+      FileName: fileName,
+      Timestamp: timestamp,
+    },
+  };
+
+  try {
+    await dynamoDB.put(params).promise();
+    res.json({ message: "X-ray prediction saved successfully!", data: params.Item });
+  } catch (error) {
+    console.error("DynamoDB Put Error:", error);
+    res.status(500).json({ error: "Error saving X-ray prediction", details: error.message });
+  }
+});
+
 
 // Start Server
 app.listen(port, () => {
