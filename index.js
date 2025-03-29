@@ -7,75 +7,162 @@ const cors = require("cors");
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Enable CORS (allows frontend to communicate with backend)
+// Enable CORS
 app.use(cors());
 app.use(express.json());
 
-// AWS Configuration (Use IAM Role if running on EC2)
+// AWS Configuration
 const awsConfig = {
-  region: process.env.AWS_REGION || "us-east-1",
+  region: process.env.AWS_REGION || "us-east-2",
 };
-
-// Use environment credentials only if not running on EC2 with IAM roles
 if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
   awsConfig.accessKeyId = process.env.AWS_ACCESS_KEY_ID;
   awsConfig.secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
 }
-
 AWS.config.update(awsConfig);
 
 // DynamoDB
 const dynamoDB = new AWS.DynamoDB.DocumentClient();
 const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME || "MedicalRecords";
 
-// S3 Storage
+// S3 for file uploads
 const s3 = new AWS.S3();
 const upload = multer({ storage: multer.memoryStorage() });
 
-// ✅ Health Check API
+// ==========
+// Middleware to get userSub
+// In production, replace this with JWT verification to set req.user.sub
+// ==========
+function mockAuth(req, res, next) {
+  // For local testing, you might pass the Cognito sub in a header: x-sub
+  // e.g. '617ba5b0-9091-7073-b7a8-fca1a6a80ee1'
+  req.user = { sub: req.headers["x-sub"] || "demo-sub" };
+  next();
+}
+app.use(mockAuth);
+
+// ==========
+// Health Check
+// ==========
 app.get("/", (req, res) => {
   res.json({ message: "Node.js Backend is Running! 🚀" });
 });
 
-// ✅ Fetch User Data
-app.get("/user", (req, res) => {
-  const userData = {
-    name: "John Doe",
-    id: "12345",
-    age: 34,
-    bloodType: "O+",
-    weight: "75kg",
+// ==========
+// Get Profile
+// ==========
+app.get("/profile", async (req, res) => {
+  const userSub = req.user.sub;
+
+  const params = {
+    TableName: TABLE_NAME,
+    Key: {
+      PatientID: userSub,
+      RecordID: "PROFILE", // we treat this as the "profile" item
+    },
   };
-  res.json(userData);
+
+  try {
+    const data = await dynamoDB.get(params).promise();
+    if (!data.Item) {
+      return res.status(404).json({ error: "Profile not found for this user." });
+    }
+    res.json(data.Item);
+  } catch (error) {
+    console.error("DynamoDB Fetch Error:", error);
+    res.status(500).json({ error: "Error fetching profile", details: error.message });
+  }
 });
 
-// ✅ Fetch Recent Records
-app.get("/records", (req, res) => {
-  const records = [
-    { name: "General Checkup", date: "Jan 15, 2025" },
-    { name: "Chest X-Ray", date: "Jan 10, 2025" },
-  ];
-  res.json(records);
+// ==========
+// Get All Medical Records (Sort Key starts with "REC#")
+// ==========
+app.get("/records", async (req, res) => {
+  const userSub = req.user.sub;
+
+  const params = {
+    TableName: TABLE_NAME,
+    KeyConditionExpression: "PatientID = :sub AND begins_with(RecordID, :rec)",
+    ExpressionAttributeValues: {
+      ":sub": userSub,
+      ":rec": "REC#",
+    },
+  };
+
+  try {
+    const data = await dynamoDB.query(params).promise();
+    res.json(data.Items || []);
+  } catch (error) {
+    console.error("DynamoDB Query Error:", error);
+    res.status(500).json({ error: "Error fetching records", details: error.message });
+  }
 });
 
-// ✅ Fetch Active Prescriptions
-app.get("/prescriptions", (req, res) => {
-  const prescriptions = [
-    { name: "Amoxicillin", dosage: "3 times daily - 7 days" },
-    { name: "Ibuprofen", dosage: "As needed for pain" },
-  ];
-  res.json(prescriptions);
+// ==========
+// Get a Single Record by RecordID
+// e.g. GET /records/REC#2025-02-10
+// ==========
+app.get("/records/:recordID", async (req, res) => {
+  const userSub = req.user.sub;
+  const { recordID } = req.params;
+
+  const params = {
+    TableName: TABLE_NAME,
+    Key: {
+      PatientID: userSub,
+      RecordID: recordID,
+    },
+  };
+
+  try {
+    const data = await dynamoDB.get(params).promise();
+    if (!data.Item) {
+      return res.status(404).json({ error: "Record not found." });
+    }
+    res.json(data.Item);
+  } catch (error) {
+    console.error("DynamoDB Fetch Error:", error);
+    res.status(500).json({ error: "Error fetching record", details: error.message });
+  }
 });
 
-// ✅ Fetch Upcoming Appointments
-app.get("/appointments", (req, res) => {
-  const appointments = [
-    { doctor: "Dr. Sarah Smith", date: "Feb 1, 2025" },
-  ];
-  res.json(appointments);
+// ==========
+// Create a New Record
+// e.g. POST /records
+// Body: { recordID: "REC#2025-03-20", Diagnosis: "X-Ray", Date: "2025-03-20" }
+// ==========
+app.post("/records", async (req, res) => {
+  const userSub = req.user.sub;
+  const { recordID, Diagnosis, Date } = req.body;
+
+  if (!recordID || !Diagnosis || !Date) {
+    return res.status(400).json({ error: "Missing required fields: recordID, Diagnosis, Date" });
+  }
+
+  const params = {
+    TableName: TABLE_NAME,
+    Item: {
+      PatientID: userSub,
+      RecordID: recordID,
+      Diagnosis,
+      Date,
+    },
+    ConditionExpression: "attribute_not_exists(PatientID) AND attribute_not_exists(RecordID)",
+  };
+
+  try {
+    await dynamoDB.put(params).promise();
+    res.json({ message: "Medical record created successfully!", data: params.Item });
+  } catch (error) {
+    console.error("DynamoDB Put Error:", error);
+    res.status(500).json({ error: "Error creating record", details: error.message });
+  }
 });
 
-// ✅ Upload X-ray to S3
+// ==========
+// Upload X-ray to S3
+// (remains mostly the same)
+// ==========
 app.post("/upload-xray", upload.single("xray"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded" });
@@ -83,7 +170,6 @@ app.post("/upload-xray", upload.single("xray"), async (req, res) => {
 
   const timestamp = Date.now();
   const filename = `${timestamp}-${req.file.originalname}`;
-
   const params = {
     Bucket: process.env.S3_BUCKET_NAME,
     Key: filename,
@@ -93,7 +179,6 @@ app.post("/upload-xray", upload.single("xray"), async (req, res) => {
 
   try {
     const uploadResult = await s3.upload(params).promise();
-    
     res.json({
       message: "X-Ray uploaded successfully!",
       url: uploadResult.Location,
@@ -106,67 +191,20 @@ app.post("/upload-xray", upload.single("xray"), async (req, res) => {
   }
 });
 
-// ✅ Store Medical Record in DynamoDB
-app.post("/save-medical-record", async (req, res) => {
-  const { PatientID, Diagnosis, Date } = req.body;
-
-  if (!PatientID || !Diagnosis || !Date) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-
-  const checkIfExists = {
-    TableName: TABLE_NAME,
-    Key: { PatientID },
-  };
-
-  try {
-    const existingRecord = await dynamoDB.get(checkIfExists).promise();
-
-    if (existingRecord.Item) {
-      return res.status(409).json({ error: "Record already exists for this patient." });
-    }
-
-    const params = {
-      TableName: TABLE_NAME,
-      Item: { PatientID, Diagnosis, Date },
-    };
-
-    await dynamoDB.put(params).promise();
-    res.json({ message: "Medical record saved successfully!", data: params.Item });
-  } catch (error) {
-    console.error("DynamoDB Error:", error);
-    res.status(500).json({ error: "Error saving record", details: error.message });
-  }
-});
-
-// ✅ Fetch Medical Record by PatientID
-app.get("/medical-record/:patientID", async (req, res) => {
-  const { patientID } = req.params;
+// ==========
+// Delete a Record
+// e.g. DELETE /records/REC#2025-02-10
+// ==========
+app.delete("/records/:recordID", async (req, res) => {
+  const userSub = req.user.sub;
+  const { recordID } = req.params;
 
   const params = {
     TableName: TABLE_NAME,
-    Key: { PatientID: patientID },
-  };
-
-  try {
-    const data = await dynamoDB.get(params).promise();
-    if (!data.Item) {
-      return res.status(404).json({ error: "No medical record found for this PatientID" });
-    }
-    res.json(data.Item);
-  } catch (error) {
-    console.error("DynamoDB Fetch Error:", error);
-    res.status(500).json({ error: "Error fetching record", details: error.message });
-  }
-});
-
-// ✅ Delete Medical Record
-app.delete("/delete-medical-record/:patientID", async (req, res) => {
-  const { patientID } = req.params;
-
-  const params = {
-    TableName: TABLE_NAME,
-    Key: { PatientID: patientID },
+    Key: {
+      PatientID: userSub,
+      RecordID: recordID,
+    },
   };
 
   try {
@@ -177,6 +215,54 @@ app.delete("/delete-medical-record/:patientID", async (req, res) => {
     res.status(500).json({ error: "Error deleting record", details: error.message });
   }
 });
+
+// ==========
+// OPTIONAL: Get All Items (Profile + Records + etc.)
+// If you want to fetch everything for the user in one query
+// ==========
+app.get("/all-items", async (req, res) => {
+  const userSub = req.user.sub;
+  const params = {
+    TableName: TABLE_NAME,
+    KeyConditionExpression: "PatientID = :sub",
+    ExpressionAttributeValues: {
+      ":sub": userSub,
+    },
+  };
+
+  try {
+    const data = await dynamoDB.query(params).promise();
+    res.json(data.Items || []);
+  } catch (error) {
+    console.error("DynamoDB Query Error:", error);
+    res.status(500).json({ error: "Error fetching all items", details: error.message });
+  }
+});
+
+// =====================================
+// Get Active Prescriptions (Sort Key starts with "PRE#")
+// =====================================
+app.get("/prescriptions", async (req, res) => {
+  const userSub = req.user.sub;
+  
+  const params = {
+    TableName: TABLE_NAME,
+    KeyConditionExpression: "PatientID = :sub AND begins_with(RecordID, :pre)",
+    ExpressionAttributeValues: {
+      ":sub": userSub,
+      ":pre": "PRE#"
+    },
+  };
+
+  try {
+    const data = await dynamoDB.query(params).promise();
+    res.json(data.Items || []);
+  } catch (error) {
+    console.error("DynamoDB Query Error for prescriptions:", error);
+    res.status(500).json({ error: "Error fetching prescriptions", details: error.message });
+  }
+});
+
 
 // Start Server
 app.listen(port, () => {
