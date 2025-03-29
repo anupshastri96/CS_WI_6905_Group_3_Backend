@@ -1,0 +1,65 @@
+
+0. zip backend Code
+
+1.Transfer the Backend Code to EC2
+
+scp -i C:\CS_WI_6905_Group_03.pem "C:\Users\Anup Shastri\OneDrive\Documents\Winter_2025\Cloud\ProjectCode\CS_WI_6905_Group_3_Backend\CS_WI_6905_Group_3_Backend.zip" ubuntu@52.14.177.241:/home/ubuntu/
+CS_WI_6905_Group_3_Backend.zip
+
+Extract the Code on EC2
+unzip CS_WI_6905_Group_3_Backend.zip -d backend
+
+cd CS_WI_6905_Group_3_Backend
+
+npm install
+
+pm2 start index.js --name backend
+
+sudo nano /etc/nginx/sites-available/backend
+
+server {
+    listen 80;
+    server_name 52.14.177.241;
+
+    location /api/ {
+        proxy_pass http://localhost:5000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+sudo ln -s /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/
+
+sudo systemctl restart nginx
+
+sudo nano /etc/nginx/sites-available/backend
+server {
+    listen 80;
+    server_name medportal.lol www.medportal.lol;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name medportal.lol www.medportal.lol;
+
+    ssl_certificate /etc/letsencrypt/live/medportal.lol/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/medportal.lol/privkey.pem;
+
+    root /var/www/html/build;
+    index index.html;
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://localhost:5000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
